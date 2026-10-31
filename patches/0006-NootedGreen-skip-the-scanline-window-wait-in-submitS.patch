@@ -1,0 +1,77 @@
+From 83adb85d766e9076f3fcb71150e1d53a43fe8862 Mon Sep 17 00:00:00 2001
+From: LilyandSimba <341599777+LilyandSimba@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 04:17:45 -0400
+Subject: [PATCH 6/8] NootedGreen: skip the scanline-window wait in
+ submitSwapFlush (XE-NOSCANSYNC)
+
+IGAccelSurface::generateSync (only caller: IGAccelSurface::submitSwapFlush)
+emits a scanline-window wait into the command stream: MI_LOAD_SCAN_LINES,
+a DERRMR unmask, MI_WAIT_FOR_EVENT and synchronousCtxSwitch. On the LOQ
+15IAX9E (ADL-S) the event never arrives: in both desktop boots the BCS
+context hung at MI_FLUSH_DW with LastContextSwitchReason
+"ELEMENT_SWITCH | WAIT_ON_SCANLINE", stamp 5 timed out and the GPU was
+reset before the login screen.
+
+On non-real-TGL hardware, route generateSync to a stub that emits
+nothing. That is the path Apple's own code takes when the pipe is
+inactive or scaled (early exit to the common return), so submitSwapFlush
+just runs without the tear-free wait. -ngreenscansync keeps Apple's
+original. The skip count is added to the XE-FLIPLOG line (ssync=).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/NootedGreen/kern_gen11.cpp | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
+index 167ddbd..33f2505 100755
+--- a/src/NootedGreen/kern_gen11.cpp
++++ b/src/NootedGreen/kern_gen11.cpp
+@@ -20,6 +20,17 @@ static volatile uint32_t gXeResFreeFix = 0;  // XE-RESFREE: entradas inválidas
+ extern volatile uint32_t gXeOrphanMiss;  // XE-NOORPHAN (kern_green.cpp)
+ extern bool gXeLockRouted;
+ void xeFlipStats(uint32_t *queue, uint32_t *complete, uint32_t *irq, uint32_t *timeout);  // xe/fliplog (kern_green.cpp)
++// xe/noscansync (29/10): IGAccelSurface::generateSync (only caller: submitSwapFlush) emits a scanline-window wait into the
++// command stream (MI_LOAD_SCAN_LINES + DERRMR unmask + MI_WAIT_FOR_EVENT + synchronousCtxSwitch). On the LOQ (ADL-S) the
++// event never arrives: two boots out of two, the BCS context hung "ELEMENT_SWITCH | WAIT_ON_SCANLINE" at MI_FLUSH_DW,
++// stamp 5 timed out and the GPU was reset before the login screen. Skipping generateSync is the path Apple itself takes
++// when the pipe is inactive or scaled (early exit, nothing emitted); the swap then runs without the tear-free wait.
++static mach_vm_address_t gOrgGenerateSync = 0;
++static volatile uint32_t gXeScanSyncSkipN = 0;
++static void xeGenerateSync(void *that, uint32_t a, uint32_t pipe, uint32_t c, const void *bounds) {
++	(void)that; (void)a; (void)pipe; (void)c; (void)bounds;
++	gXeScanSyncSkipN++;
++}
+ 
+ // ─── xe/topo4/5 (24/10): topologia escolhida por boot-arg, sem ler fusíveis ──────────────────────────────────────
+ // topo/topo2/topo3 liam os fusíveis no boot e todos travaram o boot (23/10), mesmo calculando 96 EU aqui. Agora o
+@@ -507,8 +518,8 @@ static void xeCsStateWorker(thread_call_param_t, thread_call_param_t) {
+ 		auto *cb = NGreen::callback;
+ 		uint32_t fq = 0, fc = 0, fi = 0, ft = 0;
+ 		xeFlipStats(&fq, &fc, &fi, &ft);
+-		SYSLOG("ngreen", "XE-FLIPLOG t=%u flip q=%u done=%u irq=%u tmo=%u | DISP_INT_CTL=0x%08x PIPEA ISR=0x%08x IMR=0x%08x IIR=0x%08x "
+-			   "IER=0x%08x FRMCNT=%u | PLANE_A CTL=0x%08x STRIDE=0x%x SURF=0x%08x", tick, fq, fc, fi, ft,
++		SYSLOG("ngreen", "XE-FLIPLOG t=%u flip q=%u done=%u irq=%u tmo=%u ssync=%u | DISP_INT_CTL=0x%08x PIPEA ISR=0x%08x IMR=0x%08x "
++			   "IIR=0x%08x IER=0x%08x FRMCNT=%u | PLANE_A CTL=0x%08x STRIDE=0x%x SURF=0x%08x", tick, fq, fc, fi, ft, gXeScanSyncSkipN,
+ 			   cb->readReg32(0x44200), cb->readReg32(0x44400), cb->readReg32(0x44404), cb->readReg32(0x44408),
+ 			   cb->readReg32(0x4440c), cb->readReg32(0x70040), cb->readReg32(0x70180), cb->readReg32(0x70188),
+ 			   cb->readReg32(0x7019C));
+@@ -2163,6 +2174,15 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 				}
+ 				SYSLOG("ngreen", "XE-RC6FW: sym=%d sig=%d/%d route=%d idle=%u drop=%d", sfw != 0, sigCnt, sigLock, gRc6FwOn, gRc6IdleMs, gRc6FwDrop);
+ 			}
++			// xe/noscansync (29/10): no scanline-window wait in submitSwapFlush (see xeGenerateSync). -ngreenscansync keeps it.
++			if (!NGreen::callback->isRealTGL && !checkKernelArgument("-ngreenscansync")) {
++				RouteRequestPlus noScanSync[] = {
++					{"__ZN14IGAccelSurface12generateSyncEjjjPK13IOAccelBounds", xeGenerateSync, gOrgGenerateSync},
++				};
++				bool ok = RouteRequestPlus::routeAll(patcher, index, noScanSync, address, size);
++				if (!ok) patcher.clearError();
++				SYSLOG("ngreen", "XE-NOSCANSYNC: IGAccelSurface::generateSync route=%d (off with -ngreenscansync)", ok);
++			}
+ 		}
+ 		// xe/gpurec (22/10): restore + replay the render-reset-domain sibling (RCS <-> CCS) after a GPU restart
+ 		if (!NGreen::callback->isRealTGL) xeGpuRecInstall(patcher, index, address, size);
+-- 
+2.50.1 (Apple Git-155)
+

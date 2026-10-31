@@ -1,0 +1,75 @@
+From cb4c39ddf7e3025f591f2adda98113dafaf85e16 Mon Sep 17 00:00:00 2001
+From: LilyandSimba <341599777+LilyandSimba@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 03:53:18 -0400
+Subject: [PATCH 5/8] NootedGreen: periodic flip and display interrupt log
+ (XE-FLIPLOG)
+
+The first desktop boot on the LOQ shows tearing, white frames and stale
+window pieces, but the existing flip diagnostics (queue/complete/
+interrupt/timeout counters) only go to IOLog, which never reaches the
+saved log, so the desktop period was not covered.
+
+Every 2 s in xeCsStateWorker (runs ~10 min after the first submission),
+SYSLOG one line into the Lilu buffer with the four flip counters, the
+display master interrupt control (0x44200), pipe A DE interrupt
+ISR/IMR/IIR/IER (0x44400-0x4440c; IIR only read), the pipe A frame
+counter (0x70040) and plane A CTL/STRIDE/SURF. Logging only, no
+behaviour change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/NootedGreen/kern_gen11.cpp | 15 +++++++++++++++
+ src/NootedGreen/kern_green.cpp |  4 ++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
+index 51055ab..167ddbd 100755
+--- a/src/NootedGreen/kern_gen11.cpp
++++ b/src/NootedGreen/kern_gen11.cpp
+@@ -19,6 +19,7 @@ static volatile uint32_t gXeFbDpmsN = 0;  // XE-FBDPMS: transições de repouso
+ static volatile uint32_t gXeResFreeFix = 0;  // XE-RESFREE: entradas inválidas neutralizadas
+ extern volatile uint32_t gXeOrphanMiss;  // XE-NOORPHAN (kern_green.cpp)
+ extern bool gXeLockRouted;
++void xeFlipStats(uint32_t *queue, uint32_t *complete, uint32_t *irq, uint32_t *timeout);  // xe/fliplog (kern_green.cpp)
+ 
+ // ─── xe/topo4/5 (24/10): topologia escolhida por boot-arg, sem ler fusíveis ──────────────────────────────────────
+ // topo/topo2/topo3 liam os fusíveis no boot e todos travaram o boot (23/10), mesmo calculando 96 EU aqui. Agora o
+@@ -498,6 +499,20 @@ static void xeCsStateWorker(thread_call_param_t, thread_call_param_t) {
+ 		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u csbr=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u rc1474=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
+ 			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gCsbResyncN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut,
+ 			  (unsigned)*reinterpret_cast<volatile uint8_t *>(gAccelObj + 0x1474));
++	// xe/fliplog (29/10): every 2 s into the Lilu dump (IOLog lines never reach the saved log). Flip path counters from
++	// kern_green.cpp (q = queued, done = completed, irq = vblank/transaction interrupts, tmo = completed by the timeout
++	// timer), display master interrupt control, pipe A DE interrupt ISR/IMR/IIR/IER (IIR is only read, not cleared),
++	// pipe A frame counter and plane A CTL/STRIDE/SURF.
++	if (tick % 8 == 0 && NGreen::callback) {
++		auto *cb = NGreen::callback;
++		uint32_t fq = 0, fc = 0, fi = 0, ft = 0;
++		xeFlipStats(&fq, &fc, &fi, &ft);
++		SYSLOG("ngreen", "XE-FLIPLOG t=%u flip q=%u done=%u irq=%u tmo=%u | DISP_INT_CTL=0x%08x PIPEA ISR=0x%08x IMR=0x%08x IIR=0x%08x "
++			   "IER=0x%08x FRMCNT=%u | PLANE_A CTL=0x%08x STRIDE=0x%x SURF=0x%08x", tick, fq, fc, fi, ft,
++			   cb->readReg32(0x44200), cb->readReg32(0x44400), cb->readReg32(0x44404), cb->readReg32(0x44408),
++			   cb->readReg32(0x4440c), cb->readReg32(0x70040), cb->readReg32(0x70180), cb->readReg32(0x70188),
++			   cb->readReg32(0x7019C));
++	}
+ 	if (tick < 2400 && gCsStateTc) {  // a cada 250 ms por ~10 min
+ 		uint64_t deadline;
+ 		clock_interval_to_deadline(250, kMillisecondScale, &deadline);
+diff --git a/src/NootedGreen/kern_green.cpp b/src/NootedGreen/kern_green.cpp
+index b8c8a2d..ea9e1a7 100755
+--- a/src/NootedGreen/kern_green.cpp
++++ b/src/NootedGreen/kern_green.cpp
+@@ -434,6 +434,10 @@ static uint64_t wrapDpQueue(void *that, void *t) {
+ 	if (n <= 24 || !(n & 1023)) IOLog("XeNG FLIP queue #%u ret=0x%x (complete %u)\n", n, (uint32_t)r, dpCompleteN);  // 19/10: era 1 linha por flip (ret nunca é 0)
+ 	return r;
+ }
++// xe/fliplog (29/10): the counters above for the periodic SYSLOG in xeCsStateWorker (IOLog never reaches the saved log).
++void xeFlipStats(uint32_t *queue, uint32_t *complete, uint32_t *irq, uint32_t *timeout) {
++	*queue = dpQueueN; *complete = dpCompleteN; *irq = dpTxIrqN; *timeout = dpTxTimeoutN;
++}
+ 
+ // xe/blitscratch2 (19/10): o scratch dos kernels blit3d ficava zerado. blit3d_initialize_scratch_space escreve pelo
+ // ponteiro de IOAccelSysMemory::lockForCPUAccess. Para UM objeto (gXeBlitMem, só durante a chamada feita pelo Gen11), o
+-- 
+2.50.1 (Apple Git-155)
+

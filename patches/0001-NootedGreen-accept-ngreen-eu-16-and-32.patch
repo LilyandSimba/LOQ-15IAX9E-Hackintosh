@@ -1,0 +1,45 @@
+From e5af2aaed4ca5b40f4d860f8b84448cd6e26b153 Mon Sep 17 00:00:00 2001
+From: LilyandSimba <341599777+LilyandSimba@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:37:31 -0400
+Subject: [PATCH 1/8] NootedGreen: accept ngreen-eu=16 and 32
+
+ADL-S GT1 (i5-12450HX, 8086:468B) has 16 EU in one dual subslice. The
+topology whitelist only took 48/64/80/96, so 16 was ignored and the
+96 EU default stayed. 16 and 32 go through the same eu / 8 path
+(2 or 4 subslices); initHardwareCaps derives DSS = SS / 2 without a
+division or underflow, and Apple's setAsyncSliceCount does not panic
+on a DSS count outside its table. Existing values are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/NootedGreen/kern_gen11.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
+index b042b94..4d77067 100755
+--- a/src/NootedGreen/kern_gen11.cpp
++++ b/src/NootedGreen/kern_gen11.cpp
+@@ -22,8 +22,10 @@ extern bool gXeLockRouted;
+ 
+ // ─── xe/topo4/5 (24/10): topologia escolhida por boot-arg, sem ler fusíveis ──────────────────────────────────────
+ // topo/topo2/topo3 liam os fusíveis no boot e todos travaram o boot (23/10), mesmo calculando 96 EU aqui. Agora o
+-// layout só muda com ngreen-eu=80 (ou 64/48) e, opcional, ngreen-l3=N. Sem os args: 12 SS × 8 EU, L3 8, como antes.
++// layout só muda com ngreen-eu=80 (ou 64/48/32/16) e, opcional, ngreen-l3=N. Sem os args: 12 SS × 8 EU, L3 8, como antes.
+ // Dados de 80 EU (Linux, issue #3): i5-1340P = 5 DSS × 16 EU (máscara 0x1f, DSS0 presente) -> 10 SS × 8 EU.
++// 16 EU (ADL-S GT1, i5-12450HX 8086:468B, Linux: 1 DSS) -> 2 SS × 8 EU; 32 EU = 2 DSS -> 4 SS. initHardwareCaps (SKU 2)
++// usa SS/2 = DSS (1 ou 2) sem divisão nem underflow; setAsyncSliceCount da Apple não entra em panic com DSS fora da tabela.
+ // O steering MCR continua no DSS0 (presente nos chips de 80 EU vistos). ioreg: xe-topo = eu<<8 | l3 (no acelerador).
+ static uint32_t gTopoSs = 12, gTopoL3 = 8;
+ static bool gTopoParsed = false;
+@@ -31,7 +33,7 @@ static void xeTopoArgs() {
+ 	if (gTopoParsed) return;
+ 	gTopoParsed = true;
+ 	uint32_t eu = 0, l3 = 0;
+-	if (PE_parse_boot_argn("ngreen-eu", &eu, sizeof(eu)) && (eu == 48 || eu == 64 || eu == 80 || eu == 96)) gTopoSs = eu / 8;
++	if (PE_parse_boot_argn("ngreen-eu", &eu, sizeof(eu)) && (eu == 16 || eu == 32 || eu == 48 || eu == 64 || eu == 80 || eu == 96)) gTopoSs = eu / 8;
+ 	if (PE_parse_boot_argn("ngreen-l3", &l3, sizeof(l3)) && l3 >= 2 && l3 <= 16 && !(l3 & 1)) gTopoL3 = l3;
+ }
+ static void *volatile gTopoAcc = nullptr;
+-- 
+2.50.1 (Apple Git-155)
+

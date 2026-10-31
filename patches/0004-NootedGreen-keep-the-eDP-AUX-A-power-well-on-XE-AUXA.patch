@@ -1,0 +1,68 @@
+From 69ea8c2a930d50c7f02b5bfe7ef35bac2f8d32fa Mon Sep 17 00:00:00 2001
+From: LilyandSimba <341599777+LilyandSimba@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 03:28:17 -0400
+Subject: [PATCH 4/8] NootedGreen: keep the eDP AUX A power well on (XE-AUXA)
+
+AppleIntelPowerWell::init drops the EFI reference on the boot DDI's AUX
+well ("EFI should not enable AUX0 power well - overriding" ->
+disablePowerWellAux(0)) while fAlwaysOn is still 0. NootedGreen then
+forces fAlwaysOn=1, and enablePowerWellAux bails out before touching
+the hardware when fAlwaysOn is set. AUX A stays off for the whole boot
+and every eDP AUX transfer times out (kIOReturnTimeout): no EDID, no
+DPCD, boot timings with pclk 0, and CoreDisplay marks the panel offline.
+
+After the original init and fAlwaysOn=1, on non-real-TGL hardware and
+only if Apple left fAUX[0] at 0: turn AUX A back on the way
+hwSetPowerWellStateAux does (request bit 1 in 0x45444, AUX lane enable
+bit 0 in combo PHY A PORT_CL_DW12 0x162030), poll the state bit up to
+20 times, and hold one reference in fAUX[0] so Apple's enable/disable
+pair around each transfer stops at "already/still enabled".
+-ngreennoauxa turns it off. 0x45440/0x45444/0x162030 are logged
+before and after through SYSLOG.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/NootedGreen/kern_gen11.cpp | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
+index 540b886..51055ab 100755
+--- a/src/NootedGreen/kern_gen11.cpp
++++ b/src/NootedGreen/kern_gen11.cpp
+@@ -5044,6 +5044,33 @@ void Gen11::AppleIntelPowerWellinit(AppleIntel::AppleIntelPowerWell *that, Apple
+ 	SYSLOG("ngreen", "PowerWell::init AUX — [0]=%u [1]=%u [2]=%u [3]=%u [4]=%u [5]=%u [6]=%u [7]=%u [8]=%u",
+ 		   that->fAUX[0], that->fAUX[1], that->fAUX[2], that->fAUX[3], that->fAUX[4],
+ 		   that->fAUX[5], that->fAUX[6], that->fAUX[7], that->fAUX[8]);
++
++	// xe/auxa (29/10): Apple's init drops the EFI reference on the boot DDI's AUX well ("EFI should not enable AUX%d power
++	// well - overriding" -> disablePowerWellAux(0) while fAlwaysOn is still 0). With fAlwaysOn=1, enablePowerWellAux then
++	// bails out before touching the hardware, so AUX A stays off and every eDP AUX transfer times out (no EDID/DPCD).
++	// Turn AUX A back on the way hwSetPowerWellStateAux does (request bit 1 in 0x45444, AUX lane enable bit 0 in combo PHY A
++	// PORT_CL_DW12 0x162030), then hold one reference in fAUX[0] so the enable/disable pair around each transfer stops at
++	// "already enabled" / "still enabled". Non-real-TGL only, and only if Apple left AUX A off. -ngreennoauxa disables.
++	if (!NGreen::callback->isRealTGL && that->fAUX[0] == 0 && !checkKernelArgument("-ngreennoauxa")) {
++		auto *cb = NGreen::callback;
++		const uint32_t bios0 = cb->readReg32(0x45440), drv0 = cb->readReg32(0x45444), cl0 = cb->readReg32(0x162030);
++		cb->writeReg32(0x45444, drv0 | 0x2);
++		cb->writeReg32(0x162030, cl0 | 0x1);
++		uint32_t drv1 = 0;
++		int polls = 0;
++		for (; polls < 20; polls++) {  // Apple's hwSetPowerWellStateAux also polls 0x45444 up to 20 times
++			drv1 = cb->readReg32(0x45444);
++			if (drv1 & 0x1) break;
++			IODelay(100);
++		}
++		that->fAUX[0] = 1;
++		SYSLOG("ngreen", "XE-AUXA: before 0x45440=0x%08x 0x45444=0x%08x 0x162030=0x%08x", bios0, drv0, cl0);
++		SYSLOG("ngreen", "XE-AUXA: after  0x45440=0x%08x 0x45444=0x%08x 0x162030=0x%08x polls=%d state=%s fAUX[0]=%u",
++			   cb->readReg32(0x45440), drv1, cb->readReg32(0x162030), polls, (drv1 & 0x1) ? "on" : "TIMEOUT", that->fAUX[0]);
++	} else if (!NGreen::callback->isRealTGL) {
++		SYSLOG("ngreen", "XE-AUXA: skipped (fAUX[0]=%u, 0x45440=0x%08x 0x45444=0x%08x)", that->fAUX[0],
++			   NGreen::callback->readReg32(0x45440), NGreen::callback->readReg32(0x45444));
++	}
+ }
+ 
+ // ─── Sleep/wake lifecycle hooks ──────────────────────────────────────────────
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,59 @@
+From f381f2469dfe687563c52467a31ea7cff2e81af8 Mon Sep 17 00:00:00 2001
+From: LilyandSimba <341599777+LilyandSimba@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:07:58 -0400
+Subject: [PATCH 7/8] compiler-adapter: per-compile dumps and the 250 ms wait
+ are opt-in (XE_DUMP)
+
+For the first 40 compiles of every MTLCompilerService process the adapter
+base64-dumped bitcode, input and reply into syslog and slept 250 ms so
+logd could catch the dumps before a possible crash. Compiler processes
+are short-lived, so on the LOQ 998 compiles in 40 processes had a
+median of 261 ms (first 40 per process: 267 ms; later ones: 12 ms), and
+a Liquid Glass setting change took about a second.
+
+The dumps (bc/input/reply, once-per-process hwinfo) and the wait now
+only run with XE_DUMP set in the environment (launchctl setenv XE_DUMP 1
+for new compiler processes). The dump after a contained IGC crash stays
+on; it only runs after a failure and doesn't sleep.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ macos/src/compiler-adapter.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/macos/src/compiler-adapter.cpp b/macos/src/compiler-adapter.cpp
+index f11cb67..e4875d3 100644
+--- a/macos/src/compiler-adapter.cpp
++++ b/macos/src/compiler-adapter.cpp
+@@ -22,6 +22,10 @@ int   LLVMParseBitcodeInContext2(void*, void*, void**);
+ }
+ 
+ static int g_dumps = 0;
++// XE_DUMP=1 turns the per-compile dumps (bc/input/reply, hwinfo) and the 250 ms wait back on. Off by default: the wait made
++// the first 40 compiles of every MTLCompilerService process take ~267 ms instead of ~12 ms. Set it with
++// `launchctl setenv XE_DUMP 1` (new compiler processes pick it up). The dump after a contained IGC crash stays on.
++static bool xe_dump_on() { static int v = -1; if (v < 0) v = getenv("XE_DUMP") != nullptr; return v; }
+ static const char* B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+ static void xe_dump(const char* tag, int seq, const void* p, size_t n) {
+   // base64 em linhas de ~720 chars: "xe-dump <seq> <tag> <idx>/<tot> <chars>"
+@@ -69,7 +73,7 @@ long MTLCompilerBuildRequestWithSerializedBitcode(void* comp, void* input, void*
+   int bad = LLVMParseBitcodeInContext2(ctx, buf, &mod);
+   syslog(LOG_ERR, "xe-adapter: parse bitcode -> bad=%d module=%p", bad, mod);
+   if (bad || !mod) return 0;
+-  int seq = g_dumps < 40 ? ++g_dumps : 0;
++  int seq = xe_dump_on() && g_dumps < 40 ? ++g_dumps : 0;
+   if (seq) { xe_dump("bc", seq, bc, bcSize); xe_dump("input", seq, input, (size_t)rdx > 0 && (size_t)rdx <= 0x10000 ? (size_t)rdx : 0x400); }
+   xe_install_handlers();
+   long r;
+@@ -114,7 +118,7 @@ extern "C" __attribute__((visibility("default"))) void* MTLCompilerCreate(void*
+     if (!h) h = dlopen("/System/Library/Caches/xe.bundle/Contents/MacOS/libMTLIGCCompilerPluginOld.dylib", RTLD_NOW);
+     fn = h ? (Fn)dlsym(h, "MTLCompilerCreate") : nullptr; }
+   syslog(LOG_ERR, "xe-adapter: MTLCompilerCreate hw=%p family=%u", hw, hw ? *(unsigned*)hw : 0);
+-  static int once; if (!once && hw) { once = 1; xe_dump("hwinfo", 0, hw, 0x200); }
++  static int once; if (!once && hw && xe_dump_on()) { once = 1; xe_dump("hwinfo", 0, hw, 0x200); }
+   void* comp = fn ? fn(hw) : nullptr;
+   if (comp) {
+     typedef void (*SetFn)(void*, void*);
+-- 
+2.50.1 (Apple Git-155)
+

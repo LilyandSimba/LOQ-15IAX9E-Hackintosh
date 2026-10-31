@@ -1,0 +1,111 @@
+From 7768d72c23ef0feeddef1fa65f6deaee4391425f Mon Sep 17 00:00:00 2001
+From: LilyandSimba <341599777+LilyandSimba@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:21:32 -0400
+Subject: [PATCH 3/8] NootedGreen: fix TGL framebuffer stolen size for GMS
+ 0xF0-0xFE
+
+AppleIntelBaseController::FBMemMgr_Init computes StolenMemorySize as
+(GGC << 17) & 0xFE000000, i.e. GMS x 32 MiB. It does not know the
+4 MiB encodings 0xF0-0xFE (i915: (gms - 0xF0 + 1) x 4 MiB). On the
+LOQ 15IAX9E GMS is 0xFE (60 MiB), which becomes 0xFC000000 (-64 MiB);
+fCursorOffset then lands outside the 256 MiB aperture and the
+framebuffer start() fails with "Can't create cursor memory", so the
+accelerator waits 30 s for it and later panics.
+
+- XE-GMS: when 0xF0 <= GMS <= 0xFE, byte-patch the shl/and pair in
+  FBMemMgr_Init to "mov eax, <real DSM size>" (never more than the
+  real size). Unique pattern in TGL FB 16.0.32. Non-fatal.
+- Keep the raw GMS and the real DSM size (before the 128 MiB floor)
+  from the existing decode in processPatcher.
+- Platform table framebuffer memory 64 -> 32 MiB, so FB + 4 KiB +
+  2 MiB WOPCM (34 MiB) fits in the 60 MiB stolen memory.
+- Log the GMS patch result and the framebuffer start() return value
+  with IOLog formats that have no %s, so they stay readable in the
+  unified log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/NootedGreen/kern_gen11.cpp | 25 +++++++++++++++++++++++++
+ src/NootedGreen/kern_green.cpp |  2 ++
+ src/NootedGreen/kern_green.hpp |  2 ++
+ 3 files changed, 29 insertions(+)
+
+diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
+index df241ed..540b886 100755
+--- a/src/NootedGreen/kern_gen11.cpp
++++ b/src/NootedGreen/kern_gen11.cpp
+@@ -1745,6 +1745,27 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 			SYSLOG("ngreen", "XE-VALD: ValidateTransaction opts=%d planeopts=%d fmtBGRA=%d", a, b, c);
+ 		}
+ 
++		// xe/gms (28/10): AppleIntelBaseController::FBMemMgr_Init calcula StolenMemorySize = (GGC << 17) & 0xFE000000,
++		// ou seja GMS × 32 MiB. GMS 0xF0-0xFE (passos de 4 MiB, i915: (gms - 0xF0 + 1) × 4 MiB) não é conhecido: no LOQ
++		// GMS 0xFE (60 MiB) vira 0xFC000000 (-64 MiB), fCursorOffset cai fora da abertura de 256 MiB e o start() do FB
++		// falha ("Can't create cursor memory"). Só para GMS >= 0xF0: "shl eax,0x11; and eax,0xFE000000" -> "mov eax,
++		// <tamanho real>". Nunca maior que o DSM real. Padrão único no TGL FB 16.0.32 (0x5e227). Não fatal.
++		{
++			const uint32_t gms = NGreen::callback->gmsRaw, realMB = NGreen::callback->stolenRealMB;
++			int ok = -1;
++			if (gms >= 0xF0 && gms <= 0xFE && realMB) {
++				static const uint8_t f_gms[] = {0xc1, 0xe0, 0x11, 0x25, 0x00, 0x00, 0x00, 0xfe, 0x41, 0x89, 0x84, 0x24, 0xe4, 0x0d, 0x00, 0x00};
++				static uint8_t r_gms[]       = {0xb8, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x41, 0x89, 0x84, 0x24, 0xe4, 0x0d, 0x00, 0x00};
++				const uint32_t bytes = realMB << 20;
++				r_gms[1] = (uint8_t)bytes; r_gms[2] = (uint8_t)(bytes >> 8); r_gms[3] = (uint8_t)(bytes >> 16); r_gms[4] = (uint8_t)(bytes >> 24);
++				// writable replace array passed as const pointer, see xe/topo5
++				LookupPatchPlus const pg[] = {{activeKext, f_gms, static_cast<const uint8_t *>(r_gms), arrsize(f_gms), 1}};
++				ok = LookupPatchPlus::applyAll(patcher, pg, address, size) ? 1 : 0;
++			}
++			SYSLOG("ngreen", "XE-GMS: gms=0x%x stolen=%u MiB patch=%d", gms, realMB, ok);
++			IOLog("XeNG GMS: gms=0x%x stolen=%u MiB patch=%d\n", gms, realMB, ok);
++		}
++
+ 		return true;
+ 		
+ 	}else if (kextG11HW.loadIndex == index) {
+@@ -4588,6 +4609,9 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
+ 		// cameliav=2 (CamelliaTcon2) requires GFX kext present — gate on -ngreentglwithgfx.
+ 		pinfo[1].cameliav = checkKernelArgument("-ngreentglwithgfx") ? 2 : 0;
+ 		pinfo[1].fMobile  = 1;
++		// xe/gms: FBMemMgr_Init needs FB size + 4 KiB + WOPCM (2 MiB) inside the stolen memory. The 64 MiB default needs
++		// 66 MiB, more than the LOQ's 60 MiB DSM; 32 MiB holds 4 frames of the 1920x1080 panel and needs 34 MiB.
++		pinfo[1].fInfoFramebufferMemorySize = 32 * 1024 * 1024;
+ 		// 3/3/3 baseline restored. Multi-pipe reduction is whack-a-mole — every count
+ 		// reduction reveals new cross-pipe NULL-deref sites in TGL FB internals
+ 		// (enableController +0x1356, getFreeJoinablePathCount +0xa7, etc).
+@@ -5146,6 +5170,7 @@ bool Gen11::AppleIntelBaseControllerstart(AppleIntel::AppleIntelBaseController *
+ 	xeBootDiagDump("pre-FBstart");
+ 	auto ret=FunctionCast(AppleIntelBaseControllerstart, callback->oAppleIntelBaseControllerstart)(that,param_1 );
+ 	SYSLOG("ngreen", "FBController::start() returned %d", ret);
++	IOLog("XeNG FBSTART: AppleIntelBaseController::start returned %d\n", (int)ret);  // no %s: kept public in the unified log
+ 	xeBootDiagDump("post-FBstart");
+ 	{   // again 10 s and 40 s later (thread context): writes made while the boot screen/progress bar were up and at the WindowServer handoff
+ 		static thread_call_t tc10 = nullptr, tc40 = nullptr;
+diff --git a/src/NootedGreen/kern_green.cpp b/src/NootedGreen/kern_green.cpp
+index 44949b4..b8c8a2d 100755
+--- a/src/NootedGreen/kern_green.cpp
++++ b/src/NootedGreen/kern_green.cpp
+@@ -278,6 +278,8 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
+ 		} else {
+ 			SYSLOG( "ngreen", "PANIC stolen_size=0 check DVMT in bios");
+ 		}
++		this->gmsRaw = gms;
++		this->stolenRealMB = stolen_size;
+ 		if (stolen_size<128) stolen_size=128;
+ 		stolen_size *= (1024 * 1024);
+ 		SYSLOG("ngreen", "stolen_size 0x%x",stolen_size);
+diff --git a/src/NootedGreen/kern_green.hpp b/src/NootedGreen/kern_green.hpp
+index c279582..280a5f8 100755
+--- a/src/NootedGreen/kern_green.hpp
++++ b/src/NootedGreen/kern_green.hpp
+@@ -73,6 +73,8 @@ class NGreen {
+ 	static bool wrapApplePanelSetDisplay(IOService *that, IODisplay *display);
+ 	
+ 	UInt32 stolen_size;
++	uint32_t gmsRaw {0};        // xe/gms: GGC[15:8] as read at init
++	uint32_t stolenRealMB {0};  // xe/gms: real DSM size in MiB (i915 rule), before the 128 MiB floor
+ 	uint32_t framebufferId {0};
+ 	
+ 	// Public MMIO register access (used by display link training, display merge, etc.)
+-- 
+2.50.1 (Apple Git-155)
+
