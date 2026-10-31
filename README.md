@@ -49,9 +49,10 @@ Debugged and built with help from Claude Code.
 
 ## Known issues
 
-* **NootedGreen kernel panics (not fixed yet).** I had 3 panics in 2 days, at 1, 24 and 26 minutes after boot. The Mac restarts by
-  itself. The backtraces are in NootedGreen, Apple's Tiger Lake framebuffer and the graphics accelerator (one in WindowServer, one in
-  `powermetrics`, one in `kernel_task`). It isn't tied to Wi-Fi: there were no panics during the Wi-Fi test (7 checks over 6 boots). Save your work often.
+* **NootedGreen kernel panics (not fixed yet).** The Mac has logged 7 kernel panic reports from 2026-10-28 to 2026-10-31, and it
+  restarts by itself each time. I looked closely at the 4 newest. They came 1 to 26 minutes after boot, and the backtraces point to
+  NootedGreen, Apple's Tiger Lake framebuffer and the graphics accelerator (one in WindowServer, one in `powermetrics`, two in
+  `kernel_task`). None of the 7 reports mentions Wi-Fi code. Save your work often.
 * The GPU resets once about 40 seconds after boot. It recovers and nothing visible breaks.
 * Some lag. System Settings pages can take 5 to 15 seconds to open, and wallpaper changes are slow.
 

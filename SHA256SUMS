@@ -26,4 +26,4 @@ b51e607e43ae10106c10332aa42fa6fc7fc3a09e71036c55b617c27f0405be86  patches/0003-N
 14af69437516437216a99d72733391ca63c986b17c786432550c32632b807f30  patches/0006-NootedGreen-skip-the-scanline-window-wait-in-submitS.patch
 f29c2f6f9c0c8f4ef111834085d1b4f0b78c53ea823b2e2be07cfa10f54bd32b  patches/0007-compiler-adapter-per-compile-dumps-and-the-250-ms-wa.patch
 cd27874d9203ad41d9acd549ea9adcf52a999cd9f3c321518cc66a9592e56400  patches/0008-NootedGreen-repeating-log-lines-only-with-ngreenverb.patch
-43755086a609954372336b8e19710b670f96015900a83a73bbcee072039a07df  README.md
+690b446d610c5dd445e8a6d9dfc50cc666cf47476867e27d64c9abe5e08cc478  README.md
